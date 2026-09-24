@@ -114,6 +114,74 @@ class PreviewResponse(BaseModel):
     )
 
 
+class RebalanceSegment(BaseModel):
+    """单条节目段。
+
+    ``fixed_start_at_sec`` 非空表示该段是固定点：开场时刻不可移动（时长仍可被
+    压缩）；``actual_end_at_sec`` 非空表示该段已结束，取值为实际结束时刻。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="节目段唯一标识；不能为空")
+    planned_duration_sec: int = Field(
+        ..., description="计划时长（秒），必须为正数且不短于最短时长"
+    )
+    min_duration_sec: int = Field(
+        ..., description="最短时长（秒），必须为正数；延误分摊时的压缩下限"
+    )
+    fixed_start_at_sec: int | None = Field(
+        default=None,
+        description="固定开场时刻（秒，相对节目单原点）；不可移动，缺省表示非固定点",
+    )
+    actual_end_at_sec: int | None = Field(
+        default=None,
+        description="已结束段的实际结束时刻（秒）；已结束段必须构成节目单的连续前缀",
+    )
+
+
+class RebalanceRequest(BaseModel):
+    """POST /schedule/rebalance 请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segments: list[RebalanceSegment] = Field(
+        ..., description="按播出顺序排列的节目段"
+    )
+
+
+class RebalancedSegment(BaseModel):
+    id: str
+    planned_duration_sec: int = Field(..., description="原计划时长（秒）")
+    adjusted_duration_sec: int = Field(
+        ..., description="分摊后的时长（秒）；已结束段保持计划时长"
+    )
+    compressed_sec: int = Field(
+        ..., description="被压缩吸收的秒数（planned - adjusted），已结束段为 0"
+    )
+    finished: bool = Field(..., description="该段是否已结束（已结束段不参与压缩）")
+
+
+class FixedPointSlack(BaseModel):
+    segment_id: str = Field(..., description="固定点所在段的 id")
+    fixed_start_at_sec: int = Field(..., description="固定开场时刻（秒）")
+    absorbed_sec: int = Field(
+        ..., description="该固定点前的窗口内被压缩吸收的延误秒数"
+    )
+    remaining_sec: int = Field(
+        ..., description="该固定点前的剩余秒数（发生压缩时为 0）"
+    )
+
+
+class RebalanceResponse(BaseModel):
+    segments: list[RebalancedSegment] = Field(
+        ..., description="按节目顺序排列的分摊结果"
+    )
+    fixed_points: list[FixedPointSlack] = Field(
+        ..., description="各固定点的延误吸收与剩余秒数，按固定时刻升序"
+    )
+
+
 class ErrorBody(BaseModel):
     code: Literal[
         "INVALID_REQUEST",
@@ -125,6 +193,9 @@ class ErrorBody(BaseModel):
         "DEPENDENCY_CYCLE",
         "NEGATIVE_START",
         "CHANGE_TARGET_NOT_FOUND",
+        "INVALID_FIXED_START",
+        "INVALID_ACTUAL_END",
+        "INSUFFICIENT_MARGIN",
     ]
     message: str
     details: dict | None = None

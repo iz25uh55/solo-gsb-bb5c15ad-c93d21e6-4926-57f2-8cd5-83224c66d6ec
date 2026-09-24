@@ -1,12 +1,15 @@
 # 直播导播口令编排 API
 
 基于 **Python + FastAPI** 的导播口令编排服务：接收一组带锚点依赖的直播导播口令，
-解析每条口令在时间轴上的起止毫秒，并列出同一通道内半开区间重叠的冲突口令对。
+解析每条口令在时间轴上的起止毫秒，并列出同一通道内半开区间重叠的冲突口令对；
+直播进行中还可对节目单做延误分摊，在不移动固定开场时刻的前提下把延误按各段
+可压缩余量比例分配给未播段。
 
 - 在线接口文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：`GET /health`
 - 编排接口：`POST /compile`
 - 改动预览接口：`POST /preview`
+- 节目单延误分摊接口：`POST /schedule/rebalance`
 
 ## 一条命令启动
 
@@ -16,7 +19,14 @@
 docker compose up --build -d
 ```
 
-启动后访问 <http://localhost:8000/docs> 即可在线调试。停止服务：
+启动后访问 <http://localhost:8000/docs> 即可在线调试。也可以用 curl 验证：
+
+```bash
+curl -s http://localhost:8000/health
+# {"status":"ok"}
+```
+
+停止服务：
 
 ```bash
 docker compose down
@@ -251,6 +261,152 @@ curl -s http://localhost:8000/preview \
 而把原本首尾相接的口令延长到越过对方起点时，新冲突会出现在 `added_conflicts` 中，
 区间携带改动后的版本。
 
+## 接口约定：`POST /schedule/rebalance`
+
+直播进行中，已结束段的实际结束时刻往往偏离计划，节目单整体随之延误或提前。
+本接口在**不移动任何固定开场时刻**的前提下，把延误按各段**可压缩余量**
+（计划时长 − 最短时长）的比例分摊给固定点之前的未播段，返回调整后的各段时长。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `segments` | array | 是 | 按播出顺序排列的节目段，允许为空数组 |
+
+`segments` 每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 节目段唯一 id；不能为空 |
+| `planned_duration_sec` | integer | 是 | 计划时长（秒），正数且不短于 `min_duration_sec` |
+| `min_duration_sec` | integer | 是 | 最短时长（秒），正数；延误分摊时的压缩下限 |
+| `fixed_start_at_sec` | integer | 否 | 固定开场时刻（秒，相对节目单原点 0）；不可移动，缺省表示非固定点 |
+| `actual_end_at_sec` | integer | 否 | 已结束段的实际结束时刻（秒）；缺省表示该段未播 |
+
+分摊规则：
+
+- **固定点切窗**：带 `fixed_start_at_sec` 的段是固定点，它把节目单切成若干窗口，
+  每个窗口内的段必须在窗口末尾的固定点时刻之前播完；最后一个固定点之后的段
+  没有窗口约束，保持计划时长。
+- **可用时间**：窗口内已结束段的最后一个 `actual_end_at_sec` 决定未播段的可用时间
+  （可用时间 = 固定点时刻 − 该实际结束时刻；窗口内无已结束段时从窗口起点算起）。
+- **延误分摊**：窗口内未播段计划总时长超出可用时间的部分即延误，按各段可压缩余量
+  比例分摊压缩；整数秒余数按**小数部分从大到小**分配，**同分按节目顺序**（靠前者先得）；
+  任何段不会被压到 `min_duration_sec` 以下（余量为 0 的段不参与分摊）。
+- **提前不拉伸**：可用时间有富余时不拉长任何段，富余秒数作为该固定点的
+  `remaining_sec` 返回（可追回时间）。
+- **已结束段**必须是节目单的连续前缀，其实际结束时刻单调不减；已结束段不参与压缩，
+  响应中保持计划时长。
+- **余量不足**：延误超过窗口内可压缩余量总和时，返回 `422` +
+  `INSUFFICIENT_MARGIN`，`details.unrecoverable_sec` 为无法追回的秒数。
+
+响应字段：
+
+- `segments`：按节目顺序排列，每项含 `id`、`planned_duration_sec`、
+  `adjusted_duration_sec`（分摊后时长）、`compressed_sec`（被压缩的秒数）、
+  `finished`（是否已结束）。
+- `fixed_points`：每个「前面有窗口」的固定点一项，含 `segment_id`、
+  `fixed_start_at_sec`、`absorbed_sec`（窗口内被压缩吸收的延误秒数）、
+  `remaining_sec`（固定点前剩余秒数，发生压缩时为 0）。
+
+### 请求示例（延误按比例分摊）
+
+`opening` 计划 600s 但实际 660s 才结束（晚 60s），`news` 必须在 1800s 准点开场：
+
+```bash
+curl -s http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "opening",   "planned_duration_sec": 600, "min_duration_sec": 300, "actual_end_at_sec": 660},
+      {"id": "interview", "planned_duration_sec": 900, "min_duration_sec": 600},
+      {"id": "music",     "planned_duration_sec": 600, "min_duration_sec": 300},
+      {"id": "news",      "planned_duration_sec": 300, "min_duration_sec": 300, "fixed_start_at_sec": 1800}
+    ]
+  }'
+```
+
+可用时间 = 1800 − 660 = 1140s，计划还需 900 + 600 = 1500s，延误 360s；
+`interview` 与 `music` 余量均为 300s，各摊 180s。响应示例（`200`）：
+
+```json
+{
+  "segments": [
+    {"id": "opening",   "planned_duration_sec": 600, "adjusted_duration_sec": 600, "compressed_sec": 0,   "finished": true},
+    {"id": "interview", "planned_duration_sec": 900, "adjusted_duration_sec": 720, "compressed_sec": 180, "finished": false},
+    {"id": "music",     "planned_duration_sec": 600, "adjusted_duration_sec": 420, "compressed_sec": 180, "finished": false},
+    {"id": "news",      "planned_duration_sec": 300, "adjusted_duration_sec": 300, "compressed_sec": 0,   "finished": false}
+  ],
+  "fixed_points": [
+    {"segment_id": "news", "fixed_start_at_sec": 1800, "absorbed_sec": 360, "remaining_sec": 0}
+  ]
+}
+```
+
+### 请求示例（整数秒余数分配）
+
+延误 7s、三段余量各 3s：精确分摊值均为 `7 × 3 / 9 ≈ 2.33`，每段先分 2s，
+余 1s；小数部分相同，按节目顺序补给最靠前的 `a`（`a` 压 3s，`b`、`c` 各压 2s）：
+
+```bash
+curl -s http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "a",    "planned_duration_sec": 103, "min_duration_sec": 100},
+      {"id": "b",    "planned_duration_sec": 103, "min_duration_sec": 100},
+      {"id": "c",    "planned_duration_sec": 103, "min_duration_sec": 100},
+      {"id": "news", "planned_duration_sec": 50,  "min_duration_sec": 50, "fixed_start_at_sec": 302}
+    ]
+  }'
+```
+
+```json
+{
+  "segments": [
+    {"id": "a",    "planned_duration_sec": 103, "adjusted_duration_sec": 100, "compressed_sec": 3, "finished": false},
+    {"id": "b",    "planned_duration_sec": 103, "adjusted_duration_sec": 101, "compressed_sec": 2, "finished": false},
+    {"id": "c",    "planned_duration_sec": 103, "adjusted_duration_sec": 101, "compressed_sec": 2, "finished": false},
+    {"id": "news", "planned_duration_sec": 50,  "adjusted_duration_sec": 50,  "compressed_sec": 0, "finished": false}
+  ],
+  "fixed_points": [
+    {"segment_id": "news", "fixed_start_at_sec": 302, "absorbed_sec": 7, "remaining_sec": 0}
+  ]
+}
+```
+
+### 请求示例（余量不足，422）
+
+`opening` 拖到 1700s 才结束，距离 1800s 的 `news` 只剩 100s，而 `interview`
+计划 500s、最多只能压缩 50s：
+
+```bash
+curl -s http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "opening",   "planned_duration_sec": 600, "min_duration_sec": 600, "actual_end_at_sec": 1700},
+      {"id": "interview", "planned_duration_sec": 500, "min_duration_sec": 450},
+      {"id": "news",      "planned_duration_sec": 300, "min_duration_sec": 300, "fixed_start_at_sec": 1800}
+    ]
+  }'
+```
+
+响应（`422`）：延误 400s，余量只有 50s，仍有 350s 无法追回：
+
+```json
+{
+  "code": "INSUFFICIENT_MARGIN",
+  "message": "固定点 news（1800s）前可压缩余量不足，仍有 350 秒无法追回",
+  "details": {
+    "unrecoverable_sec": 350,
+    "required_compression_sec": 400,
+    "available_margin_sec": 50,
+    "fixed_point": {"segment_id": "news", "fixed_start_at_sec": 1800}
+  }
+}
+```
+
 ## 错误处理
 
 所有业务错误均返回 HTTP `422`，响应体统一为：
@@ -276,6 +432,16 @@ curl -s http://localhost:8000/preview \
 | `DEPENDENCY_CYCLE` | 锚点依赖构成环 |
 | `NEGATIVE_START` | 解析出的口令起点小于 `0`（起点不允许为负） |
 | `CHANGE_TARGET_NOT_FOUND` | 仅 `POST /preview`：`change.id` 在口令数组中不存在 |
+| `INVALID_FIXED_START` | 仅 `POST /schedule/rebalance`：固定开场时刻为负，或未按节目顺序严格递增 |
+| `INVALID_ACTUAL_END` | 仅 `POST /schedule/rebalance`：实际结束时刻为负、已结束段不构成连续前缀、结束时刻非单调不减，或已结束固定点段结束时刻早于其固定开场时刻 |
+| `INSUFFICIENT_MARGIN` | 仅 `POST /schedule/rebalance`：固定点前可压缩余量不足，`details.unrecoverable_sec` 为无法追回的秒数 |
+
+`POST /schedule/rebalance` 额外约定：
+
+- `planned_duration_sec` 短于 `min_duration_sec`、或任一时长非正数时，返回
+  `INVALID_DURATION`；重复 `id`、空 `id` 分别返回 `DUPLICATE_ID`、`INVALID_ID`。
+- 已结束段的实际结束时刻越过下一个固定点、且窗口内已无可压缩的段时，同样返回
+  `INSUFFICIENT_MARGIN`（无法追回的时间已成事实）。
 
 `POST /preview` 额外约定：
 
@@ -293,7 +459,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-核心编排逻辑位于 `app/compiler.py`，仅使用标准库，可直接运行单元测试：
+核心编排逻辑位于 `app/compiler.py`，节目单延误分摊逻辑位于 `app/rebalance.py`，
+均仅使用标准库，可直接运行单元测试：
 
 ```bash
 python3 -m unittest discover -s tests
@@ -305,11 +472,13 @@ python3 -m unittest discover -s tests
 .
 ├── app/
 │   ├── __init__.py
-│   ├── compiler.py      # 纯标准库的依赖解析 / 时间计算 / 冲突检测
-│   ├── schemas.py       # Pydantic 请求与响应模型
-│   └── main.py          # FastAPI 入口（/compile、/preview、/health、统一错误处理）
+│   ├── compiler.py        # 纯标准库的依赖解析 / 时间计算 / 冲突检测
+│   ├── rebalance.py       # 纯标准库的节目单延误分摊（固定点切窗 + 余量比例分摊）
+│   ├── schemas.py         # Pydantic 请求与响应模型
+│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/health、统一错误处理）
 ├── tests/
-│   └── test_compiler.py # 核心逻辑单元测试（标准库 unittest）
+│   ├── test_compiler.py   # 编排核心逻辑单元测试（标准库 unittest）
+│   └── test_rebalance.py  # 延误分摊核心逻辑单元测试（标准库 unittest）
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
