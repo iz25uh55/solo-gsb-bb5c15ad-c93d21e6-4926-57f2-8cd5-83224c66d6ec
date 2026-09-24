@@ -114,6 +114,105 @@ class PreviewResponse(BaseModel):
     )
 
 
+class SegmentItem(BaseModel):
+    """一个按播出顺序排列的节目段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="节目段唯一标识；不能为空")
+    planned_duration_s: int = Field(
+        ..., description="计划时长（秒），必须为正数"
+    )
+    min_duration_s: int = Field(
+        ...,
+        description="最短时长（秒），必须为正数，且不得大于计划时长",
+    )
+    fixed_start_s: int | None = Field(
+        default=None,
+        description=(
+            "不可移动的固定开场时刻（距节目开播原点的秒数）；"
+            "不填表示该段开场时刻可随前面段落移动"
+        ),
+    )
+
+
+class ActualEndItem(BaseModel):
+    """已结束段的实际结束时刻。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="已结束的节目段 id")
+    end_s: int = Field(
+        ...,
+        description="实际结束时刻（距节目开播原点的秒数，不能为负）",
+    )
+
+
+class RebalanceRequest(BaseModel):
+    """POST /schedule/rebalance 请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segments: list[SegmentItem] = Field(
+        ..., description="按播出顺序排列的节目段"
+    )
+    actual_ends: list[ActualEndItem] = Field(
+        default_factory=list,
+        description=(
+            "已结束段的实际结束时刻；必须构成节目的连续前缀，"
+            "缺省表示节目尚未开始，按完整计划单分摊"
+        ),
+    )
+
+
+class AdjustedSegment(BaseModel):
+    id: str
+    planned_duration_s: int = Field(..., description="原计划时长（秒）")
+    adjusted_duration_s: int = Field(
+        ...,
+        description=(
+            "调整后的时长（秒）；已结束段为实际时长，其余为分摊压缩后的时长"
+        ),
+    )
+    cut_s: int = Field(
+        ...,
+        description="被压缩的秒数（>=0；已结束段为相对计划的超时/提前净值）"
+    )
+    fixed_start_s: int | None = Field(
+        ..., description="该段的固定开场时刻；无固定点时为 null"
+    )
+
+
+class FixedPointResult(BaseModel):
+    id: str = Field(..., description="固定段（分摊窗口后边界）的节目段 id")
+    fixed_start_s: int = Field(..., description="固定开场时刻（秒）")
+    segment_ids: list[str] = Field(
+        ..., description="该固定点前参与分摊的可移动段 id，按节目顺序"
+    )
+    delay_s: int = Field(
+        ..., description="固定点前的延误秒数（提前时为 0）"
+    )
+    recovered_s: int = Field(
+        ..., description="已通过压缩追回的秒数"
+    )
+    remaining_s: int = Field(
+        ...,
+        description=(
+            "固定点前剩余秒数：准点追回后为 0；提前播出时为可保留的空档秒数"
+        ),
+    )
+
+
+class RebalanceResponse(BaseModel):
+    segments: list[AdjustedSegment] = Field(
+        ..., description="按节目顺序排列的调整后时长"
+    )
+    fixed_points: list[FixedPointResult] = Field(
+        ...,
+        description="各固定点的延误分摊结果，按固定开场时刻（节目顺序）排列",
+    )
+
+
 class ErrorBody(BaseModel):
     code: Literal[
         "INVALID_REQUEST",
@@ -121,6 +220,11 @@ class ErrorBody(BaseModel):
         "INVALID_ID",
         "INVALID_CHANNEL",
         "INVALID_DURATION",
+        "INVALID_MIN_DURATION",
+        "INVALID_ACTUAL_END",
+        "ACTUAL_END_UNKNOWN_ID",
+        "FIXED_START_CONFLICT",
+        "INSUFFICIENT_SLACK",
         "MISSING_ANCHOR",
         "DEPENDENCY_CYCLE",
         "NEGATIVE_START",

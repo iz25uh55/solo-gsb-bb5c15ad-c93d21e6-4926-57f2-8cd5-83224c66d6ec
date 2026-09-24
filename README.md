@@ -1,12 +1,14 @@
 # 直播导播口令编排 API
 
 基于 **Python + FastAPI** 的导播口令编排服务：接收一组带锚点依赖的直播导播口令，
-解析每条口令在时间轴上的起止毫秒，并列出同一通道内半开区间重叠的冲突口令对。
+解析每条口令在时间轴上的起止毫秒，并列出同一通道内半开区间重叠的冲突口令对；
+另提供节目单延误分摊接口，按固定开场时刻与各段可压缩余量重排时长。
 
 - 在线接口文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：`GET /health`
 - 编排接口：`POST /compile`
 - 改动预览接口：`POST /preview`
+- 节目单延误分摊：`POST /schedule/rebalance`
 
 ## 一条命令启动
 
@@ -251,6 +253,183 @@ curl -s http://localhost:8000/preview \
 而把原本首尾相接的口令延长到越过对方起点时，新冲突会出现在 `added_conflicts` 中，
 区间携带改动后的版本。
 
+## 接口约定：`POST /schedule/rebalance`
+
+直播进行中根据固定开场时刻（**固定点**）分摊节目单延误。请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `segments` | array | 是 | 按播出顺序排列的节目段 |
+| `actual_ends` | array | 否 | 已结束段的实际结束时刻；缺省表示节目尚未开始，按完整计划单分摊 |
+
+`segments` 每一项：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 节目段唯一 id；不能为空 |
+| `planned_duration_s` | integer | 是 | 计划时长（秒），必须为正数 |
+| `min_duration_s` | integer | 是 | 最短时长（秒），必须为正数，且不得大于计划时长——任何段调整后不得低于此值 |
+| `fixed_start_s` | integer \| null | 否 | 不可移动的固定开场时刻（距节目开播原点的秒数）；不填或 `null` 表示该段开场时刻可随前面段落移动 |
+
+`actual_ends` 每一项：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 已结束的节目段 id |
+| `end_s` | integer | 是 | 实际结束时刻（距节目开播原点的秒数，不能为负） |
+
+分摊规则：
+
+- 时间原点为 `0`，所有时刻均为**整数秒**。固定段的开场时刻不可移动，固定段
+  本身按计划时长播出、**不参与压缩**。
+- 每个固定点把节目单切成彼此独立的**分摊窗口**（光标与该固定开场时刻之间的
+  可移动段）。最后一个已结束段的实际结束时刻（或原点 `0`）是当前调度光标。
+- 窗口延误秒数 = `光标 + 窗口计划总时长 - 固定开场时刻`。
+- 延误为正时，按各段**可压缩余量**（`planned_duration_s - min_duration_s`）
+  的比例摊派压缩秒数；整除不尽的余数采用**最大余数法**：整数秒余数按小数份额
+  从大到小补 1 秒，小数份额相同的按**节目顺序**（靠前的段优先）分配。
+- 任何段调整后不得低于最短时长；窗口总余量不足以吸收延误时返回 `422`
+  （`INSUFFICIENT_SLACK`），逐固定点给出无法追回的秒数。
+- 延误为负（提前播出）时不压缩也不拉长，各段保持计划时长，提前量作为固定点
+  前的空档在 `remaining_s` 中回传。
+- 已结束段必须构成节目的**连续前缀**；节目单尾部（最后一个固定点之后）的
+  可移动段没有约束，保持计划时长。
+
+响应字段：
+
+- `segments[].adjusted_duration_s`：调整后时长（已结束段为实际时长）。
+- `segments[].cut_s`：被压缩的秒数；已结束段为相对计划的净值（延误为负）。
+- `fixed_points[]`：每个固定点的分摊结果——
+  `delay_s`（延误）、`recovered_s`（已追回）、`remaining_s`（固定点前剩余秒数：
+  准点追回后为 `0`，提前播出时为可保留的空档）、`segment_ids`（参与分摊的段）。
+
+### 请求示例：延误被追回
+
+新闻段计划 600 秒、实际 660 秒结束（延误 60 秒）；其后访谈段计划 900 秒、
+最短 720 秒（可压缩余量 180 秒）；天气段是固定点，固定开场 1500 秒。
+光标 660 + 900 = 1560 > 1500，访谈段需压缩 60 秒：
+
+```bash
+curl -s http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "news",      "planned_duration_s": 600, "min_duration_s": 480},
+      {"id": "interview", "planned_duration_s": 900, "min_duration_s": 720},
+      {"id": "weather",   "planned_duration_s": 300, "min_duration_s": 240,
+       "fixed_start_s": 1500}
+    ],
+    "actual_ends": [
+      {"id": "news", "end_s": 660}
+    ]
+  }'
+```
+
+响应（`200`）：
+
+```json
+{
+  "segments": [
+    {
+      "id": "news",
+      "planned_duration_s": 600,
+      "adjusted_duration_s": 660,
+      "cut_s": -60,
+      "fixed_start_s": null
+    },
+    {
+      "id": "interview",
+      "planned_duration_s": 900,
+      "adjusted_duration_s": 840,
+      "cut_s": 60,
+      "fixed_start_s": null
+    },
+    {
+      "id": "weather",
+      "planned_duration_s": 300,
+      "adjusted_duration_s": 300,
+      "cut_s": 0,
+      "fixed_start_s": 1500
+    }
+  ],
+  "fixed_points": [
+    {
+      "id": "weather",
+      "fixed_start_s": 1500,
+      "segment_ids": ["interview"],
+      "delay_s": 60,
+      "recovered_s": 60,
+      "remaining_s": 0
+    }
+  ]
+}
+```
+
+### 请求示例：多段按余量比例分摊（最大余数法）
+
+三段均可移动，计划时长均为 100 秒、最短分别为 90 / 70 / 70 秒
+（余量 10 / 30 / 30，总余量 70）；固定点在 280 秒，窗口计划总时长 300 秒，
+需追回 20 秒。份额为 `20*10/70 ≈ 2.857`、`20*30/70 ≈ 8.571`、
+`20*30/70 ≈ 8.571`；先分底数 `2/8/8 = 18` 秒，余 2 秒：第一段小数份额
+（60/70）最大先补 1 秒，后两段小数相同（40/70）按节目顺序由第二段再补 1 秒：
+
+```bash
+curl -s http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "a", "planned_duration_s": 100, "min_duration_s": 90},
+      {"id": "b", "planned_duration_s": 100, "min_duration_s": 70},
+      {"id": "c", "planned_duration_s": 100, "min_duration_s": 70},
+      {"id": "f", "planned_duration_s": 1,   "min_duration_s": 1,
+       "fixed_start_s": 280}
+    ]
+  }'
+```
+
+压缩结果为 `a: 97s、b: 91s、c: 92s`（压缩秒数 `3 / 9 / 8`），
+`fixed_points[0].delay_s = recovered_s = 20`、`remaining_s = 0`。
+
+### 请求示例：余量不足（422）
+
+两段各只能压缩 10 秒（总余量 20 秒），固定点在 150 秒而计划总时长 200 秒，
+需追回 50 秒、缺口 30 秒：
+
+```bash
+curl -s -w '\nHTTP %{http_code}\n' http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "a", "planned_duration_s": 100, "min_duration_s": 90},
+      {"id": "b", "planned_duration_s": 100, "min_duration_s": 90},
+      {"id": "f", "planned_duration_s": 1,   "min_duration_s": 1,
+       "fixed_start_s": 150}
+    ]
+  }'
+```
+
+响应（`422`）：
+
+```json
+{
+  "code": "INSUFFICIENT_SLACK",
+  "message": "固定点 f 前可压缩余量不足：需追回 50 s，最多追回 20 s，无法追回 30 s",
+  "details": {
+    "unrecoverable_s": 30,
+    "fixed_points": [
+      {
+        "id": "f",
+        "fixed_start_s": 150,
+        "segment_ids": ["a", "b"],
+        "required_recovery_s": 50,
+        "recoverable_s": 20,
+        "shortage_s": 30
+      }
+    ]
+  }
+}
+```
+
 ## 错误处理
 
 所有业务错误均返回 HTTP `422`，响应体统一为：
@@ -276,6 +455,11 @@ curl -s http://localhost:8000/preview \
 | `DEPENDENCY_CYCLE` | 锚点依赖构成环 |
 | `NEGATIVE_START` | 解析出的口令起点小于 `0`（起点不允许为负） |
 | `CHANGE_TARGET_NOT_FOUND` | 仅 `POST /preview`：`change.id` 在口令数组中不存在 |
+| `INVALID_MIN_DURATION` | 仅 `POST /schedule/rebalance`：`min_duration_s` 非正，或大于 `planned_duration_s` |
+| `INVALID_ACTUAL_END` | 仅 `POST /schedule/rebalance`：实际结束时刻非法（为负、同段重复提交、非连续前缀、结束不晚于实际开场） |
+| `ACTUAL_END_UNKNOWN_ID` | 仅 `POST /schedule/rebalance`：实际结束时刻引用了不存在的节目段 id |
+| `FIXED_START_CONFLICT` | 仅 `POST /schedule/rebalance`：已结束的固定段实际开场时刻与其 `fixed_start_s` 不一致 |
+| `INSUFFICIENT_SLACK` | 仅 `POST /schedule/rebalance`：固定点前各段可压缩余量总和不足以吸收延误，`details.unrecoverable_s` 为无法追回的总秒数 |
 
 `POST /preview` 额外约定：
 
@@ -293,7 +477,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-核心编排逻辑位于 `app/compiler.py`，仅使用标准库，可直接运行单元测试：
+核心编排逻辑位于 `app/compiler.py`（节目单分摊位于 `app/schedule.py`），仅使用
+标准库，可直接运行单元测试：
 
 ```bash
 python3 -m unittest discover -s tests
@@ -306,10 +491,12 @@ python3 -m unittest discover -s tests
 ├── app/
 │   ├── __init__.py
 │   ├── compiler.py      # 纯标准库的依赖解析 / 时间计算 / 冲突检测
+│   ├── schedule.py      # 纯标准库的节目单延误分摊（固定点窗口 / 最大余数法）
 │   ├── schemas.py       # Pydantic 请求与响应模型
-│   └── main.py          # FastAPI 入口（/compile、/preview、/health、统一错误处理）
+│   └── main.py          # FastAPI 入口（/compile、/preview、/schedule/rebalance、/health、统一错误处理）
 ├── tests/
-│   └── test_compiler.py # 核心逻辑单元测试（标准库 unittest）
+│   ├── test_compiler.py # 核心逻辑单元测试（标准库 unittest）
+│   └── test_schedule.py # 节目单分摊单元测试（标准库 unittest）
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
